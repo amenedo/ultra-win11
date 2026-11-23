@@ -1,0 +1,392 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: 'Server Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src:
+    url('./assets/fonts/ServerMono-Regular.woff2') format('woff2'),
+    url('./assets/fonts/ServerMono-Regular.woff') format('woff');
+}
+
+@font-face {
+  font-family: 'Server Mono';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src:
+    url('./assets/fonts/ServerMono-RegularOblique.woff2') format('woff2'),
+    url('./assets/fonts/ServerMono-RegularOblique.woff') format('woff');
+}
+
+@layer base {
+  /* Light theme — white base + terminal, super-light-gray sidebars */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 16% 12%;
+    --card: 220 13% 96%;
+    --card-foreground: 222 16% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 16% 12%;
+    --primary: 209 90% 45%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 13% 90%;
+    --secondary-foreground: 222 16% 20%;
+    --muted: 220 13% 92%;
+    --muted-foreground: 220 9% 40%;
+    --accent: 220 14% 87%;
+    --accent-foreground: 222 16% 12%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 90%;
+    --input: 220 13% 90%;
+    --ring: 209 90% 45%;
+    --radius: 0.5rem;
+  }
+  /* Dark theme — black base + terminal, lifted-gray sidebars */
+  .dark {
+    /* Translucent black (≈ rgba(0,0,0,0.80)) so the window's under-window
+       vibrancy blur shows through the app surface. */
+    --background: 0 0% 0% / 0.8;
+    --foreground: 0 0% 92%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 92%;
+    --popover: 0 0% 12%;
+    --popover-foreground: 0 0% 92%;
+    --primary: 209 100% 71%;
+    --primary-foreground: 213 60% 12%;
+    --secondary: 0 0% 16%;
+    --secondary-foreground: 0 0% 92%;
+    --muted: 0 0% 16%;
+    --muted-foreground: 0 0% 58%;
+    --accent: 0 0% 20%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 18%;
+    --input: 0 0% 20%;
+    --ring: 209 100% 71%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+}
+
+/* Squircle (superellipse) corners on sidebar panel blocks, paired with their
+   rounded-xl radius so the top and bottom borders curve smoothly. */
+.ultra-panel {
+  corner-shape: superellipse(1.25);
+}
+
+/* Dropdown menus use the same smooth superellipse corners so their larger
+   radius on the popover and items curves softly rather than as a hard arc. */
+.ultra-dropdown,
+.ultra-dropdown-item {
+  corner-shape: superellipse(1.4);
+}
+.ultra-dropdown {
+  border: 0.5px solid hsl(var(--border));
+  background: hsl(220 13% 94%);
+}
+.dark .ultra-dropdown {
+  background: hsl(0 0% 8%);
+}
+
+/* Custom scrollbars — thin, rounded, and only visible while hovering the area. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+*:hover {
+  scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--muted-foreground) / 0.3);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: hsl(var(--muted-foreground) / 0.5);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.project-session-rail-top {
+  -webkit-mask-image: linear-gradient(to bottom, #000 0 calc(100% - 6px), transparent calc(100% - 6px) 100%);
+  mask-image: linear-gradient(to bottom, #000 0 calc(100% - 6px), transparent calc(100% - 6px) 100%);
+}
+.project-session-rail-bottom {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0 6px, #000 6px 100%);
+  mask-image: linear-gradient(to bottom, transparent 0 6px, #000 6px 100%);
+}
+
+@keyframes ultra-working-sparkle {
+  0%,
+  18% {
+    transform: rotate(0deg);
+  }
+  39%,
+  58% {
+    transform: rotate(180deg);
+  }
+  79%,
+  100% {
+    transform: rotate(360deg);
+  }
+}
+.ultra-working-sparkle {
+  animation: ultra-working-sparkle 1.9s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
+
+/* Modal enter/exit — slide up from below into the centered position (and back),
+   keeping the dialog horizontally + vertically centered the whole time. */
+@keyframes ultra-dialog-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 20px)) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+@keyframes ultra-dialog-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% + 20px)) scale(0.98);
+  }
+}
+.dialog-animate[data-state='open'] {
+  animation: ultra-dialog-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.dialog-animate[data-state='closed'] {
+  animation: ultra-dialog-out 150ms ease-in forwards;
+}
+
+@keyframes ultra-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.toast-animate {
+  animation: ultra-toast-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes ultra-intro-overlay {
+  0%,
+  58% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+}
+@keyframes ultra-intro-mark {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.ultra-intro-overlay {
+  animation: ultra-intro-overlay 950ms cubic-bezier(0.19, 1, 0.22, 1) forwards;
+  will-change: opacity, transform;
+}
+.ultra-intro-icon,
+.ultra-intro-name {
+  animation: ultra-intro-mark 280ms cubic-bezier(0.19, 1, 0.22, 1) both;
+  will-change: opacity, transform;
+}
+.ultra-intro-name {
+  animation-delay: 70ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ultra-intro-overlay,
+  .ultra-intro-icon,
+  .ultra-intro-name,
+  .ultra-working-sparkle {
+    animation: none;
+  }
+}
+
+/* Region used by the frameless titlebar for window dragging. */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* macOS window surface — the window carries native vibrancy (blur of whatever
+   is behind it) with no wash over it, so the app sits directly on the frosted
+   material. Corner rounding and the edge highlight are the native window's.
+   Windows 11 uses Mica the same way: the window is transparent and the
+   renderer keeps a light wash so the material reads through the black surface. */
+.mac body,
+.win body {
+  background: transparent;
+}
+html.win:not(.dark) {
+  --background: 0 0% 100% / 0.88;
+}
+html.win.dark {
+  --background: 0 0% 0% / 0.72;
+}
+.mac.fullscreen .ultra-app-header {
+  padding-left: 0.5rem;
+}
+
+/* xterm host — the one piece shadcn/Tailwind can't own (it's a canvas). */
+/* No padding here — the gap lives on the wrapper so FitAddon measures the
+   reduced area and rows don't bleed into the padding. */
+.terminal-host {
+  height: 100%;
+  min-height: 0;
+}
+.terminal-host .xterm {
+  height: 100%;
+}
+/* Hide xterm's scrollbar — scroll with wheel/trackpad, no visible bar. */
+.terminal-host .xterm-viewport {
+  scrollbar-width: none; /* Firefox */
+}
+.terminal-host .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* Fades scrolled content out at the bottom edge. Masks the content itself
+   rather than overlaying a colored gradient, so it works on any panel
+   background (idle or active, light or dark). */
+.ultra-fade-bottom {
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 2rem), transparent 100%);
+  mask-image: linear-gradient(to bottom, black calc(100% - 2rem), transparent 100%);
+}
+
+/* Mouse and keyboard selection share the same active-panel background feedback. */
+.ultra-panel {
+  transition: background-color 150ms ease;
+}
+.ultra-panel-active {
+  background-color: hsl(var(--card));
+}
+.dark .ultra-panel-active {
+  background-color: hsl(0deg 0% 10%);
+}
+
+/* Active project tab, squircle-cornered pill with two states. Idle: the same
+   light-gray fill as a focused panel (see .ultra-panel-active). Working: the
+   fill drains away and a full-strength foreground outline pulses in step with
+   the spinning sparkle in the tab.
+
+   The working ring lives on an ::after overlay drawn over the idle ring. Its
+   opacity (transition) handles entering/leaving the working state, while the
+   pulse keyframes animate only its outline-color — split across two properties
+   so the animation never overrides the enter/exit ease. */
+.ultra-tab-active {
+  corner-shape: superellipse(1.1);
+  background-color: hsl(var(--card));
+  outline: 1px solid hsl(var(--foreground) / 0.35);
+  outline-offset: -2px;
+  transition: background-color 200ms ease-out;
+}
+.dark .ultra-tab-active {
+  background-color: hsl(0deg 0% 10%);
+}
+/* While working the fill drains away and the pulsing outline takes over.
+   Doubled selector so it outranks the .dark idle rule in both themes. */
+.ultra-tab-active.ultra-tab-working {
+  background-color: transparent;
+}
+.ultra-tab-active::after {
+  content: '';
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  corner-shape: superellipse(1.1);
+  outline: 1px solid hsl(var(--foreground));
+  outline-offset: -2px;
+  opacity: 0;
+  transition: opacity 200ms ease-out;
+}
+/* Breathing pulse while working, phase-locked to the sparkle: both animations
+   start the moment "running" flips on and share the sparkle's 1.9s period, so
+   the outline and the spin read as one indicator. */
+@keyframes ultra-tab-working-pulse {
+  0%,
+  100% {
+    outline-color: hsl(var(--foreground));
+  }
+  50% {
+    outline-color: hsl(var(--foreground) / 0.4);
+  }
+}
+.ultra-tab-working::after {
+  opacity: 1;
+  animation: ultra-tab-working-pulse 1.9s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ultra-panel {
+    transition: none;
+  }
+  /* Working state flips instantly with no fade or pulse — the state is still
+     shown, just without motion. */
+  .ultra-tab-active,
+  .ultra-tab-active::after {
+    transition: none;
+  }
+  .ultra-tab-working::after {
+    animation: none;
+  }
+}

@@ -1,0 +1,751 @@
+import {
+  app,
+  shell,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  nativeTheme,
+  nativeImage,
+  Menu,
+  Tray,
+  powerSaveBlocker,
+  type MenuItemConstructorOptions
+} from 'electron'
+import { join } from 'path'
+import { promises as fsp } from 'fs'
+import { createPty, writePty, resizePty, killPty, killAllPty, ptyPids } from './pty'
+import { listPorts, listSessionProcesses, killProcess, systemStats } from './system-service'
+import { loadWorkspace, saveWorkspace } from './store'
+import {
+  listDir,
+  readFilePreview,
+  writeFile,
+  expandToFiles,
+  createFile,
+  createDir,
+  rename,
+  watchRoot,
+  unwatchRoot,
+  unwatchAll
+} from './fs-service'
+import { probeCommand } from './agents'
+import {
+  watchTranscripts,
+  followTranscripts,
+  unwatchTranscripts,
+  unwatchAllTranscripts,
+  type TranscriptSource
+} from './transcripts'
+import {
+  startChatAgent,
+  sendChatAgent,
+  setChatAgentMode,
+  setChatAgentModel,
+  interruptChatAgent,
+  stopChatAgent,
+  stopAllChatAgents,
+  chatAgentState,
+  chatAgentModels,
+  type ChatAgentId,
+  type ChatMode
+} from './chat-agent'
+import * as git from './git-service'
+import { openInEditor } from './editor'
+import { initUpdater, checkForUpdatesManually, isQuittingForUpdate } from './updater'
+import { SleepPreventionController } from './sleep-prevention'
+
+// Taskbar grouping and toast identity. Set before the window exists.
+if (process.platform === 'win32') app.setAppUserModelId('com.ultra.terminal')
+
+let mainWindow: BrowserWindow | null = null
+let selectedDockIconDataUrl: string | null = null
+
+// "Are you sure you want to close Ultra?" guard. The renderer pushes the
+// persisted preference here on hydrate/toggle; default matches the store's.
+let confirmOnClose = true
+let isQuitting = false
+const sleepPrevention = new SleepPreventionController(powerSaveBlocker)
+
+/** Only ever hand real web URLs to the OS; anything else (about:blank from
+ *  xterm's default link handler, file:, etc.) would make macOS show a
+ *  "no application can open this" alert. */
+function openExternalUrl(url: unknown): void {
+  if (typeof url === 'string' && /^https?:\/\//i.test(url)) void shell.openExternal(url)
+}
+
+// Keep in sync with DOCK_ICON_SCALE in renderer/lib/appIcons.ts: macOS dock
+// icons carry a transparent inset, but our icon PNGs are full-bleed. Without
+// this the launch icon looks oversized until the renderer applies its own.
+const DOCK_ICON_CANVAS_SIZE = 1024
+const DOCK_ICON_SCALE = 0.82
+
+function insetDockIcon(img: Electron.NativeImage): Electron.NativeImage {
+  if (img.isEmpty()) return img
+  const drawSize = Math.round(DOCK_ICON_CANVAS_SIZE * DOCK_ICON_SCALE)
+  const offset = Math.round((DOCK_ICON_CANVAS_SIZE - drawSize) / 2)
+  const src = img.resize({ width: drawSize, height: drawSize }).toBitmap()
+  const out = Buffer.alloc(DOCK_ICON_CANVAS_SIZE * DOCK_ICON_CANVAS_SIZE * 4)
+  for (let y = 0; y < drawSize; y++) {
+    src.copy(out, ((y + offset) * DOCK_ICON_CANVAS_SIZE + offset) * 4, y * drawSize * 4, (y + 1) * drawSize * 4)
+  }
+  return nativeImage.createFromBitmap(out, {
+    width: DOCK_ICON_CANVAS_SIZE,
+    height: DOCK_ICON_CANVAS_SIZE
+  })
+}
+
+function bundledIcon(name: string): Electron.NativeImage {
+  const path = app.isPackaged
+    ? join(process.resourcesPath, name)
+    : join(app.getAppPath(), 'build', name)
+  return nativeImage.createFromPath(path)
+}
+
+function loadDefaultDockIcon(): Electron.NativeImage {
+  const name = nativeTheme.shouldUseDarkColors ? 'icon-dark.png' : 'icon-light.png'
+  const img = bundledIcon(name)
+  // macOS dock icons expect a transparent inset. The Windows taskbar wants
+  // the full-bleed mark, which is also what the .ico embeds.
+  return process.platform === 'darwin' ? insetDockIcon(img) : img
+}
+
+function applyWindowIcon(img: Electron.NativeImage): void {
+  if (img.isEmpty()) return
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.setIcon(img)
+  }
+}
+
+/** Selected Ultra mark: Dock on macOS, taskbar icon on Windows. */
+function applyDockIcon(dataUrl?: unknown): void {
+  if (dataUrl !== undefined) selectedDockIconDataUrl = typeof dataUrl === 'string' ? dataUrl : null
+
+  const customImg =
+    typeof selectedDockIconDataUrl === 'string' && selectedDockIconDataUrl.startsWith('data:image/')
+      ? nativeImage.createFromDataURL(selectedDockIconDataUrl)
+      : null
+  const img = customImg && !customImg.isEmpty() ? customImg : loadDefaultDockIcon()
+  if (img.isEmpty()) return
+
+  if (process.platform === 'darwin' && app.dock) app.dock.setIcon(img)
+  else applyWindowIcon(img)
+}
+
+function titleBarOverlayOptions(): Electron.TitleBarOverlayOptions {
+  const dark = nativeTheme.shouldUseDarkColors
+  return {
+    color: '#00000000',
+    symbolColor: dark ? '#f5f5f5' : '#1a1a1a',
+    height: 48
+  }
+}
+
+function syncTitleBarOverlay(): void {
+  if (process.platform !== 'win32' || !mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.setTitleBarOverlay(titleBarOverlayOptions())
+}
+
+// Menu bar sparkle. The renderer renders the spin frames of the Ultra sparkle
+// (the same mark shown next to shell names) once; the animation timer lives
+// HERE because renderer timers are throttled while the window is hidden —
+// precisely when the menu bar indicator matters. Works even with no window.
+let tray: Tray | null = null
+let trayIdleImage: Electron.NativeImage | null = null
+let trayFrameImages: Electron.NativeImage[] = []
+let trayIntervalMs = 75
+let trayWorking = false
+let trayAnimate = true
+let trayTimer: NodeJS.Timeout | null = null
+let trayFrame = 0
+// When true the user has hidden the menu-bar icon: don't create the Tray, and
+// destroy it if one already exists. Frames are still cached so re-enabling works.
+let hideTrayIcon = false
+let trayIdleDataUrl: string | null = null
+let trayFrameDataUrls: string[] = []
+
+// Renderer PNGs are rendered at 2x for an 18pt-tall menu bar icon. Decode them
+// at scaleFactor 2 so macOS keeps each frame's natural aspect (the working
+// frames are wider than tall) instead of squaring the icon off.
+function trayImageFromDataUrl(dataUrl: unknown): Electron.NativeImage | null {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return null
+  const comma = dataUrl.indexOf(',')
+  if (comma < 0) return null
+  const img = nativeImage.createFromBuffer(Buffer.from(dataUrl.slice(comma + 1), 'base64'), {
+    scaleFactor: 2
+  })
+  if (img.isEmpty()) return null
+  if (process.platform === 'darwin') {
+    // Template image: macOS tints it to match the menu bar in light and dark mode.
+    img.setTemplateImage(true)
+    return img
+  }
+  // The frames are black shapes. On a dark Windows notification area they
+  // disappear, so paint them white while keeping the alpha.
+  if (process.platform === 'win32' && nativeTheme.shouldUseDarkColors) return tintWhite(img)
+  return img
+}
+
+function tintWhite(img: Electron.NativeImage): Electron.NativeImage {
+  try {
+    const scale = img.getScaleFactors()[0] ?? 1
+    const { width, height } = img.getSize(scale)
+    const buf = Buffer.from(img.toBitmap({ scaleFactor: scale }))
+    if (buf.length !== width * height * 4) return img
+    for (let i = 0; i < buf.length; i += 4) {
+      buf[i] = 255
+      buf[i + 1] = 255
+      buf[i + 2] = 255
+    }
+    const tinted = nativeImage.createFromBitmap(buf, { width, height, scaleFactor: scale })
+    return tinted.isEmpty() ? img : tinted
+  } catch {
+    return img
+  }
+}
+
+function stopTrayTimer(): void {
+  if (trayTimer) {
+    clearInterval(trayTimer)
+    trayTimer = null
+  }
+}
+
+function showMainWindow(): void {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (win) {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  } else {
+    createWindow()
+  }
+}
+
+function rebuildTrayImages(): void {
+  trayIdleImage = trayIdleDataUrl ? trayImageFromDataUrl(trayIdleDataUrl) : null
+  trayFrameImages = trayFrameDataUrls
+    .map((frame) => trayImageFromDataUrl(frame))
+    .filter((img): img is Electron.NativeImage => img !== null)
+}
+
+function applyTrayState(): void {
+  rebuildTrayImages()
+  if (!tray || !trayIdleImage) return
+  tray.setToolTip(trayWorking ? 'Ultra — agent working' : 'Ultra')
+  stopTrayTimer()
+
+  if (!trayWorking || trayFrameImages.length === 0) {
+    tray.setImage(trayIdleImage)
+    return
+  }
+  trayFrame = 0
+  tray.setImage(trayFrameImages[0])
+  if (!trayAnimate || trayFrameImages.length < 2) return
+  trayTimer = setInterval(() => {
+    if (!tray) return
+    trayFrame = (trayFrame + 1) % trayFrameImages.length
+    tray.setImage(trayFrameImages[trayFrame])
+  }, trayIntervalMs)
+}
+
+/** Cache the renderer's frame set and create the tray on first delivery. */
+function setTrayFrames(payload: unknown): void {
+  const { idle, frames, intervalMs } = (payload ?? {}) as {
+    idle?: unknown
+    frames?: unknown
+    intervalMs?: unknown
+  }
+  if (typeof idle !== 'string' || !Array.isArray(frames)) return
+  const frameUrls = frames.filter((frame): frame is string => typeof frame === 'string')
+  if (frameUrls.length === 0) return
+
+  trayIdleDataUrl = idle
+  trayFrameDataUrls = frameUrls
+  if (typeof intervalMs === 'number' && intervalMs >= 16) trayIntervalMs = intervalMs
+
+  rebuildTrayImages()
+  ensureTray()
+  applyTrayState()
+}
+
+/** Create the notification-area icon from cached frames, unless the user hid it. */
+function ensureTray(): void {
+  if (tray || hideTrayIcon || !trayIdleImage) return
+  tray = new Tray(trayIdleImage)
+  tray.setToolTip('Ultra')
+  tray.on('click', () => showMainWindow())
+  if (process.platform === 'win32') {
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: 'Show Ultra', click: () => showMainWindow() },
+        { type: 'separator' },
+        { label: 'Quit Ultra', click: () => app.quit() }
+      ])
+    )
+  }
+}
+
+/** Toggle the menu-bar icon on/off at runtime. */
+function setTrayVisible(visible: boolean): void {
+  hideTrayIcon = !visible
+  if (hideTrayIcon) {
+    stopTrayTimer()
+    tray?.destroy()
+    tray = null
+  } else {
+    rebuildTrayImages()
+    ensureTray()
+    applyTrayState()
+  }
+}
+
+// Application menu. Owns Cmd+D (new session) / Cmd+W (close session) — the
+// latter replaces the default "Close Window" accelerator. Keeps the standard
+// edit/view roles so terminal copy/paste etc. still work.
+function buildAppMenu(): void {
+  const isMac = process.platform === 'darwin'
+  const send = (cmd: string): void =>
+    BrowserWindow.getFocusedWindow()?.webContents.send('menu:command', cmd)
+
+  const checkForUpdates: MenuItemConstructorOptions = {
+    label: 'Check for Updates…',
+    click: () => void checkForUpdatesManually(BrowserWindow.getFocusedWindow() ?? undefined)
+  }
+
+  // Standard app menu plus "Check for Updates…" right under About, the
+  // conventional macOS spot (same placement Sparkle apps use).
+  const appMenu: MenuItemConstructorOptions = {
+    role: 'appMenu',
+    submenu: [
+      { role: 'about' },
+      checkForUpdates,
+      { type: 'separator' },
+      { role: 'services' },
+      { type: 'separator' },
+      { role: 'hide' },
+      { role: 'hideOthers' },
+      { role: 'unhide' },
+      { type: 'separator' },
+      { role: 'quit' }
+    ]
+  }
+
+  const template: MenuItemConstructorOptions[] = [
+    ...(isMac ? [appMenu] : []),
+    // Windows and Linux have no app menu. Alt reveals this bar; the window
+    // itself uses the custom title bar (or the native one on Linux).
+    ...(!isMac
+      ? [
+          {
+            label: 'File',
+            submenu: [checkForUpdates, { type: 'separator' as const }, { role: 'quit' as const }]
+          }
+        ]
+      : []),
+    {
+      label: 'Session',
+      submenu: [
+        {
+          label: 'New Session',
+          accelerator: 'CmdOrCtrl+D',
+          click: () => send('new-session')
+        },
+        {
+          label: 'Close Session',
+          accelerator: 'CmdOrCtrl+W',
+          click: () => send('close-session')
+        },
+        { type: 'separator' },
+        // Cmd+1..9 jump to the Nth project tab.
+        ...Array.from({ length: 9 }, (_, i): MenuItemConstructorOptions => {
+          const n = i + 1
+          return {
+            label: `Project ${n}`,
+            accelerator: `CmdOrCtrl+${n}`,
+            click: () => send(`switch-project-${n}`)
+          }
+        })
+      ]
+    },
+    { role: 'editMenu' },
+    // Standard View menu, except zoom routes through the renderer so the
+    // focused panel can claim Cmd+/- (the editor scales its own font) before
+    // falling back to app-wide zoom.
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        {
+          label: 'Actual Size',
+          accelerator: 'CmdOrCtrl+0',
+          click: () => send('zoom-reset')
+        },
+        {
+          label: 'Zoom In',
+          accelerator: 'CmdOrCtrl+Plus',
+          click: () => send('zoom-in')
+        },
+        // Hidden twin so plain Cmd+= (no Shift) also zooms in, like browsers do.
+        {
+          label: 'Zoom In',
+          accelerator: 'CmdOrCtrl+=',
+          visible: false,
+          acceleratorWorksWhenHidden: true,
+          click: () => send('zoom-in')
+        },
+        {
+          label: 'Zoom Out',
+          accelerator: 'CmdOrCtrl+-',
+          click: () => send('zoom-out')
+        },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    // Custom Window menu WITHOUT a Cmd+W close item, so Close Session owns it.
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        ...(isMac ? [{ type: 'separator' as const }, { role: 'front' as const }] : [])
+      ]
+    }
+  ]
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
+
+function createWindow(): void {
+  const isMac = process.platform === 'darwin'
+  const isWin = process.platform === 'win32'
+  const icon = bundledIcon('icon.ico')
+  const windowIcon = icon.isEmpty() ? bundledIcon('icon.png') : icon
+
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 880,
+    minWidth: 800,
+    minHeight: 500,
+    show: false,
+    icon: windowIcon.isEmpty() ? undefined : windowIcon,
+    // macOS: native vibrancy, traffic lights inset from the top edge.
+    // Windows 11: Mica, rounded corners, and the native caption buttons
+    // overlaid on the custom header (min / max / snap / close).
+    ...(isMac
+      ? {
+          backgroundColor: '#00000000',
+          vibrancy: 'under-window' as const,
+          visualEffectState: 'followWindow' as const,
+          titleBarStyle: 'hidden' as const,
+          trafficLightPosition: { x: 20, y: 18 }
+        }
+      : isWin
+        ? {
+            backgroundColor: '#00000000',
+            backgroundMaterial: 'mica' as const,
+            titleBarStyle: 'hidden' as const,
+            titleBarOverlay: titleBarOverlayOptions(),
+            roundedCorners: true,
+            autoHideMenuBar: true,
+            thickFrame: true
+          }
+        : {
+            backgroundColor: '#14161b',
+            titleBarStyle: 'default' as const
+          }),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false, // node-pty data flows through main; renderer stays sandboxed-by-API
+      // The Dock working animation is timed in the renderer; Chromium throttles
+      // (and eventually freezes) hidden-window timers, which froze it mid-spin.
+      backgroundThrottling: false
+    }
+  })
+
+  mainWindow.on('ready-to-show', () => mainWindow?.show())
+
+  // Optional close guard: intercept the red button / Cmd+W-on-window / Cmd+Q
+  // and ask before tearing down sessions. `closeConfirmed` lets the confirmed
+  // close proceed without re-prompting.
+  let closeConfirmed = false
+  mainWindow.on('close', (e) => {
+    // Never block the updater's restart-to-install with a confirmation.
+    if (isQuittingForUpdate()) return
+    if (!confirmOnClose || closeConfirmed || !mainWindow) return
+    e.preventDefault()
+    const wasQuitting = isQuitting
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Close Ultra'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Are you sure you want to close Ultra?',
+      detail: 'All terminal sessions and running agents will be terminated.'
+    })
+    if (choice === 1) {
+      closeConfirmed = true
+      // preventDefault aborted the in-flight quit, so restart it; a plain
+      // window close just closes the window.
+      if (wasQuitting) app.quit()
+      else mainWindow.destroy()
+    } else {
+      isQuitting = false
+    }
+  })
+
+  // The renderer squares its corners while the window fills the screen.
+  const sendFullScreen = (fs: boolean): void => {
+    if (mainWindow && !mainWindow.isDestroyed())
+      mainWindow.webContents.send('window:fullscreen', fs)
+  }
+  mainWindow.on('enter-full-screen', () => sendFullScreen(true))
+  mainWindow.on('leave-full-screen', () => sendFullScreen(false))
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalUrl(url)
+    return { action: 'deny' }
+  })
+
+  // electron-vite injects the dev server URL via this env var
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+  if (devUrl) {
+    mainWindow.loadURL(devUrl)
+  } else {
+    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+  }
+
+  // Open the inspector only in development — never in packaged (DMG) builds,
+  // so end users don't see the console on launch.
+  if (!app.isPackaged) mainWindow.webContents.openDevTools({ mode: 'detach' })
+}
+
+function registerIpc(): void {
+  ipcMain.on('pty:create', (e, { id, cwd, cols, rows, command, minimalPrompt }) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (win) createPty(win, id, { cwd, cols, rows, command, minimalPrompt })
+  })
+  ipcMain.on('pty:input', (_e, { id, data }) => writePty(id, data))
+  ipcMain.on('pty:resize', (_e, { id, cols, rows }) => resizePty(id, cols, rows))
+  ipcMain.on('pty:kill', (_e, { id }) => killPty(id))
+
+  ipcMain.handle('dialog:pickDirectory', async (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    const res = await dialog.showOpenDialog(win!, {
+      properties: ['openDirectory', 'createDirectory']
+    })
+    return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0]
+  })
+
+  ipcMain.handle('dialog:pickFiles', async (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    const res = await dialog.showOpenDialog(win!, {
+      properties: ['openFile', 'multiSelections']
+    })
+    return res.canceled ? [] : res.filePaths
+  })
+
+  ipcMain.handle('store:load', () => loadWorkspace())
+  ipcMain.handle('store:save', (_e, data) => saveWorkspace(data))
+
+  ipcMain.handle('fs:listDir', (_e, dir: string) => listDir(dir))
+  ipcMain.handle('fs:readFile', (_e, path: string) => readFilePreview(path))
+  ipcMain.handle('fs:writeFile', (_e, path: string, content: string) => writeFile(path, content))
+  ipcMain.handle('fs:expandToFiles', (_e, paths: string[]) => expandToFiles(paths))
+  ipcMain.handle('fs:createFile', (_e, path: string) => createFile(path))
+  ipcMain.handle('fs:createDir', (_e, path: string) => createDir(path))
+  ipcMain.handle('fs:rename', (_e, oldPath: string, newPath: string) => rename(oldPath, newPath))
+  ipcMain.on('fs:watch', (e, root: string) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (win && root) watchRoot(win, root)
+  })
+  ipcMain.on('fs:unwatch', (_e, root: string) => unwatchRoot(root))
+  ipcMain.on('fs:reveal', (_e, path: string) => shell.showItemInFolder(path))
+  ipcMain.handle('fs:openPath', (_e, path: string) => shell.openPath(path))
+  ipcMain.handle('fs:trash', async (_e, path: string) => {
+    try {
+      await shell.trashItem(path)
+      return true
+    } catch {
+      return false
+    }
+  })
+
+  ipcMain.handle('agent:probe', (_e, command: string) => probeCommand(command))
+
+  ipcMain.on('transcript:watch', (e, cwd: string) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (win && cwd) watchTranscripts(win, cwd)
+  })
+  ipcMain.on('transcript:unwatch', (_e, cwd: string) => unwatchTranscripts(cwd))
+  ipcMain.on(
+    'transcript:follow',
+    (_e, p: { cwd: string; source: TranscriptSource | null; since: number }) =>
+      followTranscripts(p.cwd, p.source, p.since)
+  )
+
+  ipcMain.on(
+    'chatAgent:start',
+    (e, p: { id: string; cwd: string; agent: ChatAgentId; mode: ChatMode }) => {
+      const win = BrowserWindow.fromWebContents(e.sender)
+      if (win && p.id && p.cwd)
+        startChatAgent(win, p.id, { cwd: p.cwd, agent: p.agent, mode: p.mode })
+    }
+  )
+  ipcMain.on('chatAgent:send', (_e, p: { id: string; text: string }) => sendChatAgent(p.id, p.text))
+  ipcMain.on('chatAgent:setMode', (_e, p: { id: string; mode: ChatMode }) =>
+    setChatAgentMode(p.id, p.mode)
+  )
+  ipcMain.on('chatAgent:setModel', (_e, p: { id: string; model: string | null }) =>
+    setChatAgentModel(p.id, p.model)
+  )
+  ipcMain.handle('chatAgent:models', (_e, agent: ChatAgentId) => chatAgentModels(agent))
+  ipcMain.on('chatAgent:interrupt', (_e, id: string) => interruptChatAgent(id))
+  ipcMain.on('chatAgent:stop', (_e, id: string) => stopChatAgent(id))
+  ipcMain.handle('chatAgent:state', (_e, id: string) => chatAgentState(id))
+
+  ipcMain.handle('git:status', (_e, cwd: string) => git.getStatus(cwd))
+  ipcMain.handle('git:init', (_e, cwd: string) => git.init(cwd))
+  ipcMain.handle('git:stage', (_e, cwd: string, file: string) => git.stage(cwd, file))
+  ipcMain.handle('git:stageAll', (_e, cwd: string) => git.stageAll(cwd))
+  ipcMain.handle('git:unstage', (_e, cwd: string, file: string) => git.unstage(cwd, file))
+  ipcMain.handle('git:discard', (_e, cwd: string, file: string, untracked: boolean) =>
+    git.discard(cwd, file, untracked)
+  )
+  ipcMain.handle('git:commit', (_e, cwd: string, message: string) => git.commit(cwd, message))
+  ipcMain.handle('git:branches', (_e, cwd: string) => git.branches(cwd))
+  ipcMain.handle('git:switch', (_e, cwd: string, name: string) => git.switchBranch(cwd, name))
+  ipcMain.handle('git:createBranch', (_e, cwd: string, name: string) =>
+    git.createBranch(cwd, name)
+  )
+  ipcMain.handle('git:push', (_e, cwd: string) => git.push(cwd))
+  ipcMain.handle('git:pull', (_e, cwd: string) => git.pull(cwd))
+  ipcMain.handle('git:fetch', (_e, cwd: string) => git.fetch(cwd))
+  ipcMain.handle('git:diff', (_e, cwd: string, file: string, staged: boolean) =>
+    git.diff(cwd, file, staged)
+  )
+  ipcMain.handle('git:log', (_e, cwd: string) => git.log(cwd))
+
+  ipcMain.handle('editor:open', (_e, command: string, path: string) =>
+    openInEditor(command, path)
+  )
+
+  ipcMain.handle('system:ports', () => listPorts())
+  ipcMain.handle('system:processes', () => listSessionProcesses(ptyPids()))
+  ipcMain.handle('system:kill', (_e, pid: number) => killProcess(pid))
+  ipcMain.handle('system:stats', () => systemStats())
+
+  // Sync the native window appearance (titlebar + traffic lights) to the app theme.
+  ipcMain.on('theme:setNative', (_e, mode: 'dark' | 'light') => {
+    nativeTheme.themeSource = mode === 'dark' ? 'dark' : 'light'
+    syncTitleBarOverlay()
+    applyTrayState()
+  })
+
+  ipcMain.on('app:setDockIcon', (_e, dataUrl: string | null) => {
+    applyDockIcon(typeof dataUrl === 'string' ? dataUrl : null)
+  })
+
+  ipcMain.on('app:openExternal', (_e, url: unknown) => openExternalUrl(url))
+  ipcMain.on('app:setConfirmClose', (_e, enabled: unknown) => {
+    confirmOnClose = enabled !== false
+  })
+  ipcMain.on('app:setPreventSleep', (_e, active: unknown) => {
+    sleepPrevention.setActive(active === true)
+  })
+
+  ipcMain.handle('app:getVersion', () => app.getVersion())
+  ipcMain.on('updates:check', (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    void checkForUpdatesManually(win ?? undefined)
+  })
+
+  // Window sizing + screenshot, for the View menu's "Take screenshot": the user
+  // sets an exact content size, then captures the window to the Desktop. Sizing
+  // in content pixels keeps what they type matching what capturePage() records.
+  ipcMain.handle('window:getSize', (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender) ?? mainWindow
+    const [width, height] = win?.getContentSize() ?? [0, 0]
+    return { width, height }
+  })
+  ipcMain.handle('window:setSize', (e, width: number, height: number) => {
+    const win = BrowserWindow.fromWebContents(e.sender) ?? mainWindow
+    if (!win) return { width: 0, height: 0 }
+    // A fixed size can't apply while the window fills the screen or is zoomed.
+    if (win.isFullScreen()) win.setFullScreen(false)
+    if (win.isMaximized()) win.unmaximize()
+    win.setContentSize(Math.max(1, Math.round(width)), Math.max(1, Math.round(height)))
+    const [w, h] = win.getContentSize() // may be clamped to minWidth/minHeight
+    return { width: w, height: h }
+  })
+  ipcMain.handle('app:screenshot', async (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender) ?? mainWindow
+    if (!win) return null
+    const image = await win.webContents.capturePage()
+    if (image.isEmpty()) return null
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const file = join(app.getPath('desktop'), `Ultra ${stamp}.png`)
+    try {
+      await fsp.writeFile(file, image.toPNG())
+      return file
+    } catch {
+      return null
+    }
+  })
+
+  ipcMain.on('app:setTrayFrames', (_e, payload: unknown) => setTrayFrames(payload))
+  ipcMain.on('app:setTrayState', (_e, state: { working?: boolean; animate?: boolean }) => {
+    trayWorking = state?.working === true
+    trayAnimate = state?.animate !== false
+    applyTrayState()
+  })
+  ipcMain.on('app:setTrayVisible', (_e, visible: unknown) => setTrayVisible(visible !== false))
+}
+
+app.whenReady().then(() => {
+  registerIpc()
+  buildAppMenu()
+  createWindow()
+  applyDockIcon()
+  nativeTheme.on('updated', () => {
+    applyDockIcon()
+    syncTitleBarOverlay()
+    applyTrayState()
+  })
+  initUpdater()
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
+})
+
+app.on('window-all-closed', () => {
+  sleepPrevention.stop()
+  killAllPty()
+  unwatchAll()
+  unwatchAllTranscripts()
+  stopAllChatAgents()
+  if (process.platform !== 'darwin') app.quit()
+})
+
+// Mark quits so the window close guard can distinguish Cmd+Q from a plain
+// window close. Cleanup lives in will-quit, which only fires once every
+// window agreed to close — before-quit would kill the PTYs even when the
+// user cancels the confirmation dialog.
+app.on('before-quit', () => {
+  isQuitting = true
+})
+
+app.on('will-quit', () => {
+  sleepPrevention.stop()
+  stopTrayTimer()
+  killAllPty()
+  unwatchAll()
+  unwatchAllTranscripts()
+  stopAllChatAgents()
+})
