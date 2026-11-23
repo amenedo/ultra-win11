@@ -159,7 +159,12 @@ export function watchRoot(win: BrowserWindow, root: string): void {
       if (!win.isDestroyed()) win.webContents.send('fs:changed', { root })
     }, 200)
   }
-  watcher.on('add', ping).on('unlink', ping).on('addDir', ping).on('unlinkDir', ping)
+  watcher
+    .on('add', ping)
+    .on('change', ping)
+    .on('unlink', ping)
+    .on('addDir', ping)
+    .on('unlinkDir', ping)
   watchers.set(root, watcher)
 }
 

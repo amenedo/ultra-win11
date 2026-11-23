@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { fileManagerName } from '@/lib/platform'
+import { joinChild, parentDir } from '../lib/paths'
 
 interface NodeProps {
   entry: DirEntry
@@ -56,8 +57,9 @@ function TreeNode({
     const name = editName.trim()
     setEditing(false)
     if (!name || name === entry.name) return
-    const parent = entry.path.slice(0, entry.path.lastIndexOf('/'))
-    const ok = await window.api.fs.rename(entry.path, `${parent}/${name}`)
+    const parent = parentDir(entry.path)
+    if (!parent) return
+    const ok = await window.api.fs.rename(entry.path, joinChild(parent, name))
     if (!ok) window.alert('Could not rename (name already in use?)')
   }
 

@@ -20,9 +20,17 @@ export function relTo(root: string, p: string): string {
   return child
 }
 
+/** Directory containing a path. Accepts Windows and POSIX separators. */
+export function parentDir(p: string): string {
+  const trimmed = p.replace(/[\\/]+$/, '')
+  const idx = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  return idx >= 0 ? trimmed.slice(0, idx) : ''
+}
+
 /** Join a new file or folder name onto a project root, keeping the root's separator. */
 export function joinChild(root: string, name: string): string {
   const clean = name.replace(/^[\\/]+/, '')
-  const sep = /\\/.test(root) && !root.startsWith('/') ? '\\' : '/'
+  const windows = (/\\/.test(root) || /^[a-zA-Z]:/.test(root)) && !root.startsWith('/')
+  const sep = windows ? '\\' : '/'
   return `${root.replace(/[\\/]+$/, '')}${sep}${clean}`
 }

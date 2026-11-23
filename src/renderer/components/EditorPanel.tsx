@@ -9,6 +9,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useStore } from '../store/useStore'
 import { cn } from '@/lib/utils'
 import { modKeyLabel } from '@/lib/platform'
+import { rememberDraft, type DraftSnapshot } from '@/lib/drafts'
 
 type Loaded =
   | { kind: 'text'; content: string }
@@ -16,6 +17,9 @@ type Loaded =
   | { kind: 'error'; reason: string }
 
 const isMarkdown = (name: string): boolean => /\.(md|markdown|mdx)$/i.test(name)
+
+/** Unsaved editor text, keyed by path, so switching files does not discard it. */
+const unsavedDrafts = new Map<string, string>()
 
 export default function EditorPanel(): JSX.Element {
   const activeFile = useStore((s) => s.activeFile)
@@ -39,6 +43,12 @@ export default function EditorPanel(): JSX.Element {
 
   const path = activeFile?.path ?? null
   const dirty = loaded?.kind === 'text' && draft !== loaded.content
+  // Last file whose draft we can still compare with disk. Updated while the
+  // user types, and read when the active path changes.
+  const sessionRef = useRef<DraftSnapshot | null>(null)
+  if (path && sessionRef.current?.path === path && loaded?.kind === 'text') {
+    sessionRef.current = { path, draft, saved: loaded.content }
+  }
   const markdown = !!activeFile && isMarkdown(activeFile.name)
   // Markdown opens as a rendered preview; the header toggle switches to editing.
   const [preview, setPreview] = useState(false)
@@ -94,8 +104,13 @@ export default function EditorPanel(): JSX.Element {
     return nodes
   }, [findOpen, matches, draft, query, activeMatch])
 
-  // Load the file whenever the active file changes.
+  // Load the file whenever the active file changes. A dirty draft for the
+  // file we are leaving is kept and restored if that file is opened again.
   useEffect(() => {
+    const previous = sessionRef.current
+    if (previous && previous.path !== path) rememberDraft(unsavedDrafts, previous)
+    sessionRef.current = null
+
     if (!path) {
       setLoaded(null)
       setDraft('')
@@ -104,6 +119,7 @@ export default function EditorPanel(): JSX.Element {
     let live = true
     setLoaded(null)
     setPreview(isMarkdown(path))
+    const kept = unsavedDrafts.get(path)
     window.api.fs
       .readFile(path)
       .then((res) => {
@@ -111,8 +127,10 @@ export default function EditorPanel(): JSX.Element {
         if (res.tooLarge) {
           setLoaded({ kind: 'readonly', reason: 'Binary or file too large to edit here.' })
         } else {
+          const nextDraft = kept ?? res.content
           setLoaded({ kind: 'text', content: res.content })
-          setDraft(res.content)
+          setDraft(nextDraft)
+          sessionRef.current = { path, draft: nextDraft, saved: res.content }
         }
       })
       .catch(() => live && setLoaded({ kind: 'error', reason: 'Could not read this file.' }))
@@ -126,7 +144,11 @@ export default function EditorPanel(): JSX.Element {
     setSaving(true)
     const ok = await window.api.fs.writeFile(path, draft)
     setSaving(false)
-    if (ok) setLoaded({ kind: 'text', content: draft })
+    if (ok) {
+      setLoaded({ kind: 'text', content: draft })
+      unsavedDrafts.delete(path)
+      sessionRef.current = { path, draft, saved: draft }
+    }
     else window.alert('Could not save this file.')
   }
 

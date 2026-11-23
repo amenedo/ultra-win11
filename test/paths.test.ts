@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { relTo, basename, joinChild } from '../src/renderer/lib/paths'
+import { relTo, basename, joinChild, parentDir } from '../src/renderer/lib/paths'
 
 describe('relTo', () => {
   it('returns the path relative to root', () => {
@@ -36,6 +36,19 @@ describe('joinChild', () => {
     expect(joinChild('C:\\proj', 'notes.md')).toBe('C:\\proj\\notes.md')
     expect(joinChild('/proj/', 'notes.md')).toBe('/proj/notes.md')
     expect(joinChild('C:\\proj', '\\nested\\a.txt')).toBe('C:\\proj\\nested\\a.txt')
+  })
+
+  it('joins onto a Windows drive root', () => {
+    expect(joinChild('C:', 'file.txt')).toBe('C:\\file.txt')
+  })
+})
+
+describe('parentDir', () => {
+  it('drops the last segment for both separators', () => {
+    expect(parentDir('C:\\project\\file.txt')).toBe('C:\\project')
+    expect(parentDir('C:\\file.txt')).toBe('C:')
+    expect(parentDir('/a/b/c.ts')).toBe('/a/b')
+    expect(parentDir('/a/b/')).toBe('/a')
   })
 })
 

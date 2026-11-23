@@ -1143,6 +1143,9 @@ export const useStore = create<AppState>((set, get) => ({
       const project = st.projects.find((p) => p.id === projectId)
       if (!project) return st
       // Kill every PTY belonging to the project and drop its sessions.
+      // The chat agent is a separate process keyed by project id; leaving it
+      // running would keep editing the folder after the project is gone.
+      window.api.chatAgent.stop(projectId)
       const sessions = { ...st.sessions }
       for (const sid of project.sessionIds) {
         window.api.pty.kill(sid)
@@ -1185,6 +1188,7 @@ export const useStore = create<AppState>((set, get) => ({
   clearAllProjects: () =>
     set((st) => {
       for (const sid of Object.keys(st.sessions)) window.api.pty.kill(sid)
+      for (const project of st.projects) window.api.chatAgent.stop(project.id)
       // Start over from the default state: a single "home" project + shell.
       const fresh = makeDefault()
       const next: AppState = {
