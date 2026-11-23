@@ -1,0 +1,62 @@
+appId: com.ultra.terminal
+productName: Ultra
+directories:
+  buildResources: build
+  output: release
+
+# Auto-updates (electron-updater): Windows clients fetch latest.yml and the
+# NSIS installer from the latest GitHub release. Building with this config
+# present also generates release/latest.yml, which must be uploaded alongside
+# the installer.
+publish:
+  - provider: github
+    owner: amenedo
+    repo: ultra-win11
+
+# Only-negative globs keep electron-builder's default include (**/*) and its
+# production-dependency pruning, while dropping source/config we don't ship.
+files:
+  - '!src/**'
+  - '!docs/**'
+  - '!**/*.map'
+  - '!electron.vite.config.ts'
+  - '!tsconfig*.json'
+  - '!tailwind.config.js'
+  - '!postcss.config.js'
+  - '!components.json'
+
+# node-pty ships a native .node binary that can't be loaded from inside the asar.
+asarUnpack:
+  - node_modules/node-pty/**
+
+# Appearance-specific icons, loaded at runtime (taskbar + tray fallback).
+extraResources:
+  - from: build/icon-light.png
+    to: icon-light.png
+  - from: build/icon-dark.png
+    to: icon-dark.png
+  - from: build/icon.ico
+    to: icon.ico
+  - from: build/icon.png
+    to: icon.png
+
+win:
+  icon: build/icon.ico
+  # NSIS for the host architecture. Cross-compiling node-pty to a second
+  # arch (for example arm64 from an x64 machine) is not supported.
+  target: nsis
+  artifactName: Ultra-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Ultra
+  uninstallDisplayName: Ultra
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  license: LICENSE
